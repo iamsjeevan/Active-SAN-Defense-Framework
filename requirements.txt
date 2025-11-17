@@ -1,0 +1,17 @@
+# Core Simulation Framework
+ns.py
+
+# ns.py is built on SimPy, but listing it explicitly is good practice
+simpy
+
+# Graph Theory and Dynamic Routing Algorithms
+networkx
+
+# Data Analysis and Manipulation
+pandas
+
+# Data Visualization
+matplotlib
+
+# For analyzing and plotting results in notebooks
+jupyter
