@@ -74,18 +74,36 @@ class FailingSwitch(SimplePacketSwitch):
         for port in self.ports:
             port.out = None
 
+    # def put(self, packet):
+    #     """
+    #     Simple forwarding override:
+    #     - If failed, drop packet
+    #     - If active, forward to the first connected outbound port
+    #     """
+    #     if self.is_failed:
+    #         return
+
+    #     for port in self.ports:
+    #         if getattr(port, "out", None) is not None:
+    #             return port.put(packet)
+
+    #     # No ports available → drop silently
+    #     return
     def put(self, packet):
         """
         Simple forwarding override:
-        - If failed, drop packet
-        - If active, forward to the first connected outbound port
+        - If failed: drop packet
+        - If active: forward to the first connected outbound port
+        - If none connected: drop packet safely
         """
         if self.is_failed:
-            return
+            return  # drop silently
 
         for port in self.ports:
-            if getattr(port, "out", None) is not None:
+            out = getattr(port, "out", None)
+            if out is not None:
                 return port.put(packet)
 
-        # No ports available → drop silently
+        # No outbound ports → drop the packet (IMPORTANT!)
         return
+

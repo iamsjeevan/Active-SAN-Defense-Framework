@@ -1,13 +1,19 @@
 # File: simulations/02_static_fattree_baseline.py
+# FINAL CORRECTED VERSION
 
 import simpy
 import functools
 import random
+import networkx as nx  # <<< --- STEP 1: IMPORT THE NETWORKX LIBRARY
 
 from ns.packet.dist_generator import DistPacketGenerator
 from ns.packet.sink import PacketSink
 from ns.topos.fattree import build as build_fattree
 from san_components.failing_switch import FailingSwitch
+
+def get_port_index(ft, switch_id, neighbor_id):
+            neighbors = list(ft.adj[switch_id])
+            return neighbors.index(neighbor_id)
 
 def run_simulation(simulation_time=2000):
     """
@@ -59,32 +65,52 @@ def run_simulation(simulation_time=2000):
 
     # --- 4. Manually Program the Static Route ---
     # Find the shortest path for our flow
-    path = list(ft.shortest_paths(server_id, sink_id))[0]
+    # <<< --- STEP 2: USE THE CORRECT NETWORKX FUNCTION SYNTAX --- >>>
+    path = list(nx.all_shortest_paths(ft, server_id, sink_id))[0]
 
     # Wire the generator to the first switch
     first_switch_id = path[1]
     packet_generator.out = ft.nodes[first_switch_id]['device']
 
     print(f"--- Setting up static route for Flow 0 ---")
-    print(f"Path: {' -> '.join(path)}")
+    print(f"Path: {' -> '.join(map(str, path))}")
 
     # Program the Forwarding Information Base (FIB) for each switch in the path
+    # for i in range(1, len(path) - 1):
+    #     current_switch_id = path[i]
+    #     next_hop_id = path[i+1]
+        
+    #     # Find the port on the current switch that connects to the next hop
+
+    #     port_to_next_hop = get_port_index(ft, current_switch_id, next_hop_id)
+
+        
+    #     current_switch = ft.nodes[current_switch_id]['device']
+    #     next_hop_device = ft.nodes[next_hop_id]['device']
+
+    #     # Set the forwarding rule: "If you see a packet with flow_id 0, send it out of this port"
+    #     current_switch.demux.fib[0] = port_to_next_hop
+        
+    #     # Physically connect the port's output to the next device in the chain
+    #     current_switch.ports[port_to_next_hop].out = next_hop_device
+    # --- 4. Manually Program the Static Route ---
     for i in range(1, len(path) - 1):
         current_switch_id = path[i]
-        next_hop_id = path[i+1]
-        
-        # Find the port on the current switch that connects to the next hop
-        port_to_next_hop = ft.get_edge_data(current_switch_id, next_hop_id)['port']
-        
-        current_switch = ft.nodes[current_switch_id]['device']
-        next_hop_device = ft.nodes[next_hop_id]['device']
+        next_hop_id = path[i + 1]
 
-        # Set the forwarding rule: "If you see a packet with flow_id 0, send it out of this port"
-        current_switch.demux.fib[0] = port_to_next_hop
-        
-        # Physically connect the port's output to the next device in the chain
+        current_switch = ft.nodes[current_switch_id]["device"]
+        next_hop_device = ft.nodes[next_hop_id]["device"]
+
+        # Determine outgoing port index
+        port_to_next_hop = get_port_index(ft, current_switch_id, next_hop_id)
+
+        # Disconnect ALL ports first
+        for port in current_switch.ports:
+            port.out = None
+
+        # Connect ONLY the correct port
         current_switch.ports[port_to_next_hop].out = next_hop_device
-
+        print(f"Route: Switch {current_switch_id} → port {port_to_next_hop} → Switch {next_hop_id}")
     # --- 5. Run the Simulation ---
     print(f"--- Starting Static Fat-Tree SAN Simulation ---")
     env.run(until=simulation_time)
