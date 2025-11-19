@@ -23,7 +23,7 @@ The primary goal is to provide a quantitative analysis of the improvements in ke
 *   **Underlying Framework:** [SimPy](https://simpy.readthedocs.io/)
 *   **Dynamic Routing & Topology:** [NetworkX](https://networkx.org/)
 *   **Data Analysis & Visualization:** [Pandas](https://pandas.pydata.org/) & [Matplotlib](https://matplotlib.org/)
-*   **Programming Language:** Python 3.10+
+*   **Programming Language:** Python 3.09+
 
 ---
 
