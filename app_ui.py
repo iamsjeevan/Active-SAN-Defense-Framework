@@ -1,203 +1,179 @@
 import streamlit as st
 import networkx as nx
-import matplotlib.pyplot as plt
-import numpy as np
+import plotly.graph_objects as go
+import random
 
-# Import your backend classes
-# Make sure simulation_backend.py is in the same folder
+# Import Backend
 try:
-    from simulation_backend import ANSCompressor, ReliabilityMath
+    from simulation_backend import ReliabilityMath, TopologyManager
 except ImportError:
-    st.error("Error: 'simulation_backend.py' not found. Please save your backend code in the same directory.")
+    st.error("❌ Error: 'simulation_backend.py' not found.")
     st.stop()
 
-# --- CONFIGURATION ---
-st.set_page_config(page_title="Active SAN Defense Framework", layout="wide")
-THRESHOLD_MBPS = 800
+st.set_page_config(page_title="Active SAN Visualization", layout="wide")
 
-# --- HELPER FUNCTIONS ---
-
-def build_topology():
-    """
-    Creates the NetworkX DiGraph and Layout.
-    Hierarchical Layout: Server (Top) -> Switches (Middle) -> Storage (Bottom).
-    """
-    G = nx.DiGraph()
-    
-    # Nodes
-    nodes = ['Server', 'SwA1', 'SwB1', 'SwA2', 'SwB2', 'Storage']
-    G.add_nodes_from(nodes)
-    
-    # Edges (Directed)
-    edges = [
-        ('Server', 'SwA1'), ('Server', 'SwB1'),
-        ('SwA1', 'SwA2'), 
-        ('SwB1', 'SwB2'),
-        ('SwA2', 'Storage'), ('SwB2', 'Storage')
+# --- INITIALIZATION ---
+if 'nodes' not in st.session_state:
+    st.session_state['nodes'] = ['Server-1', 'SwA1', 'SwB1', 'SwA2', 'SwB2', 'Storage-1']
+if 'edges' not in st.session_state:
+    st.session_state['edges'] = [
+        ('Server-1', 'SwA1'), ('Server-1', 'SwB1'), 
+        ('SwA1', 'SwA2'), ('SwB1', 'SwB2'), 
+        ('SwA2', 'Storage-1'), ('SwB2', 'Storage-1'),
+        ('SwA1', 'SwB1'), ('SwA2', 'SwB2')
     ]
-    G.add_edges_from(edges)
-    
-    # Manual Positions for Hierarchical View (x, y)
-    pos = {
-        'Server':  (0, 3),
-        'SwA1':   (-1, 2), 'SwB1': (1, 2),
-        'SwA2':   (-1, 1), 'SwB2': (1, 1),
-        'Storage': (0, 0)
-    }
-    return G, pos
 
-def calculate_node_status(G, raw_traffic, use_ans, use_rerouting):
-    """
-    Logic for Novelty #1 (Compression) and Novelty #2 (Rerouting/Coloring).
-    Returns: colors list, node_labels dict, log_messages list
-    """
-    colors = []
-    labels = {}
-    logs = []
-    
-    # 1. Initialize ANS Compressor from Backend
-    compressor = ANSCompressor()
-    
-    # 2. Determine Load per path (Split 50/50 from Server)
-    path_a_load = raw_traffic / 2
-    path_b_load = raw_traffic / 2
-    
-    # Apply Novelty #1: ANS Compression
-    comp_ratio = 1.0
-    if use_ans:
-        # Compress the traffic using backend logic
-        path_a_load, comp_ratio = compressor.compress(path_a_load)
-        path_b_load = path_b_load / comp_ratio # Apply same ratio to path B for consistency
-        logs.append(f"**ANS Active:** Compressed traffic by ratio {comp_ratio:.2f}x")
+# --- CONTROLS ---
+st.sidebar.header("1. Controls")
+scenario = st.sidebar.radio("Scenario", ["1. Baseline", "2. ANS Compression", "3. Rerouting", "4. Full Defense"])
+traffic_input = st.sidebar.slider("Traffic Load (MB/s)", 0, 3000, 1800)
+threshold = 1000
 
-    # Map loads to nodes
-    node_loads = {
-        'Server': raw_traffic,
-        'SwA1': path_a_load, 'SwA2': path_a_load,
-        'SwB1': path_b_load, 'SwB2': path_b_load,
-        'Storage': path_a_load + path_b_load
-    }
+st.sidebar.markdown("---")
+st.sidebar.header("2. Topology")
+mode = st.sidebar.selectbox("Mode", ["Predefined Mesh", "Custom Builder"])
 
-    # 3. Iterate nodes to determine Color and Logic
-    for node in G.nodes():
-        load = node_loads.get(node, 0)
+G = nx.DiGraph()
+pos = {}
+
+if mode == "Predefined Mesh":
+    G, pos = TopologyManager.get_predefined_topology("Mesh (Standard)")
+else:
+    G.add_nodes_from(st.session_state['nodes'])
+    G.add_edges_from(st.session_state['edges'])
+    pos = nx.spring_layout(G, seed=42)
+
+# --- RUN BACKEND SIMULATION ---
+node_data, logs, ratio = ReliabilityMath.simulate_traffic_flow(G, traffic_input, scenario, threshold)
+
+# --- VISUALIZATION FUNCTION ---
+def draw_flow_graph(G, pos, node_data, scenario_mode, limit):
+    fig = go.Figure()
+
+    # 1. DRAW PIPES (EDGES)
+    for edge in G.edges():
+        start, end = edge
+        if start not in pos or end not in pos: continue
+        x0, y0 = pos[start]
+        x1, y1 = pos[end]
         
-        # Label text (Node Name + Load)
-        labels[node] = f"{node}\n{int(load)}MB/s"
+        # Status checks
+        start_status = node_data.get(start, {})
+        end_status = node_data.get(end, {})
+        is_horizontal = abs(y0 - y1) < 0.5 
         
-        # Default Colors
-        if node in ['Server', 'Storage']:
-            colors.append('#d3d3d3') # Grey for endpoints
-            continue
+        # Default Style
+        line_color = '#888888'
+        line_dash = 'solid'
+        label_text = "" 
+        show_arrow = True
+        width = 2
 
-        # --- NOVELTY #2 LOGIC ---
-        if load > THRESHOLD_MBPS:
-            if use_rerouting:
-                # Logic: Simulate moving traffic, color GREEN, print message
-                colors.append('#90EE90') # Green (Safe/Fixed)
-                
-                # Identify neighbor for logging
-                neighbor = "SwB1" if "SwA" in node else "SwA1"
-                logs.append(f"⚠️ **Defense Triggered:** {node} overloaded ({int(load)} MB/s). Traffic dynamically rerouted to {neighbor}.")
+        # LOGIC: What does this pipe look like?
+        
+        # A. DEAD PATH (Source Died)
+        if start_status.get('state') == 'Dead':
+            line_color = '#444444' # Dark Grey
+            line_dash = 'dot'
+            label_text = "DISCONNECTED"
+            show_arrow = False
+            
+        # B. REROUTE PATH (Horizontal)
+        elif is_horizontal:
+            # Only show if Active Reroute happened
+            if ("Rerouting" in scenario_mode or "Full" in scenario_mode) and start_status.get('state') == 'Rerouted':
+                line_color = '#FFA15A' # Orange
+                width = 4
+                # Parse logs to find amount moved (simple heuristic for visualization)
+                moved_amount = int(node_data[end]['load'] - (limit * 0.9)) if node_data[end]['load'] > 0 else 0
+                # If exact calc fails, just show generic "Reroute"
+                label_text = f"REROUTING<br>~{moved_amount} MB" if moved_amount > 0 else "REROUTING"
             else:
-                # Logic: Danger State
-                colors.append('#FF4B4B') # Red (Critical)
-                logs.append(f"❌ **CRITICAL:** {node} Overloaded ({int(load)} MB/s). Packet loss imminent.")
+                # Inactive Backup Path
+                line_color = '#EEEEEE' 
+                line_dash = 'dot'
+                show_arrow = False
+                
+        # C. NORMAL PATH (Vertical)
         else:
-            # Normal State
-            colors.append('#90EE90') # Green (Safe)
+            current_flow = int(end_status.get('load', 0))
+            label_text = f"{current_flow} MB"
+            
+            # Overload Check
+            if current_flow > limit:
+                line_color = '#EF553B' # Red
+                width = 4
+                label_text += " (CRITICAL)"
 
-    return colors, labels, logs, comp_ratio
+        # DRAW LINE
+        fig.add_trace(go.Scatter(
+            x=[x0, x1], y=[y0, y1],
+            line=dict(width=width, color=line_color, dash=line_dash),
+            hoverinfo='none', mode='lines'
+        ))
 
-# --- MAIN APP ---
+        # DRAW ARROW & LABEL
+        if show_arrow:
+            mid_x = (x0 + x1) / 2
+            mid_y = (y0 + y1) / 2
+            
+            fig.add_annotation(
+                x=mid_x, y=mid_y,
+                text=label_text,
+                showarrow=True,
+                arrowhead=2,
+                arrowsize=1.5,
+                arrowwidth=1,
+                arrowcolor=line_color,
+                ax=(x0 + mid_x)/2, ay=(y0 + mid_y)/2,
+                bgcolor="white", # White Box for Text
+                bordercolor=line_color,
+                borderwidth=1,
+                font=dict(size=10, color="black")
+            )
 
-def main():
-    st.title("🛡️ Active SAN Defense Framework")
-    st.markdown("Research Implementation: *Reliability of Storage Area Networks*")
+    # 2. DRAW NODES
+    node_x, node_y, node_c, node_txt, border_c = [], [], [], [], []
+    for node in G.nodes():
+        if node not in pos: continue
+        x, y = pos[node]
+        node_x.append(x); node_y.append(y)
+        
+        data = node_data.get(node, {'load': 0, 'color': 'grey'})
+        node_c.append(data['color'])
+        
+        hover = f"<b>{node}</b><br>Load: {int(data['load'])} MB/s<br>State: {data.get('state', 'OK')}"
+        node_txt.append(hover)
+        border_c.append('black')
 
-    # --- SIDEBAR ---
-    with st.sidebar:
-        st.header("Simulation Controls")
-        
-        # Input 1: Traffic Slider
-        traffic_input = st.slider("Input Traffic Load (MB/s)", min_value=0, max_value=2000, value=1500, step=50)
-        
-        st.markdown("---")
-        st.subheader("Research Novelties")
-        
-        # Input 2: Novelty 1 Checkbox
-        enable_ans = st.checkbox("Enable ANS Compression (Novelty 1)")
-        
-        # Input 3: Novelty 2 Checkbox
-        enable_reroute = st.checkbox("Enable Dynamic Rerouting (Novelty 2)")
-        
-        st.markdown("---")
-        st.info(f"Overload Threshold: {THRESHOLD_MBPS} MB/s")
+    fig.add_trace(go.Scatter(
+        x=node_x, y=node_y, mode='markers+text',
+        text=list(G.nodes()), textposition="top center",
+        hoverinfo='text', hovertext=node_txt,
+        marker=dict(size=45, color=node_c, line=dict(width=2, color=border_c))
+    ))
 
-    # --- LAYOUT ---
-    col_graph, col_logs = st.columns([2, 1])
+    fig.update_layout(showlegend=False, margin=dict(b=0,l=0,r=0,t=0), xaxis={'visible':False}, yaxis={'visible':False}, height=600)
+    return fig
 
-    # --- LOGIC EXECUTION ---
-    G, pos = build_topology()
-    node_colors, node_labels, log_messages, ratio = calculate_node_status(
-        G, traffic_input, enable_ans, enable_reroute
-    )
+# --- RENDER UI ---
+col1, col2 = st.columns([3, 1])
 
-    # --- VISUALIZATION (Matplotlib + NetworkX) ---
-    with col_graph:
-        st.subheader("Topology Visualization")
-        
-        fig, ax = plt.subplots(figsize=(8, 6))
-        
-        # Draw Edges
-        nx.draw_networkx_edges(G, pos, ax=ax, edge_color='gray', arrowstyle='->', arrowsize=20)
-        
-        # Draw Nodes
-        nx.draw_networkx_nodes(G, pos, ax=ax, node_color=node_colors, node_size=2500, edgecolors='black')
-        
-        # Draw Labels
-        nx.draw_networkx_labels(G, pos, ax=ax, labels=node_labels, font_size=9, font_weight='bold')
-        
-        # Formatting
-        ax.set_title(f"Current Traffic Flow (Total: {traffic_input} MB/s)")
-        ax.axis('off')
-        
-        # Render in Streamlit
-        st.pyplot(fig)
+with col1:
+    st.subheader(f"Network Flow: {scenario}")
+    if len(G.nodes) > 0:
+        st.plotly_chart(draw_flow_graph(G, pos, node_data, scenario, threshold), use_container_width=True)
 
-    # --- LOGS & METRICS (Backend Integration) ---
-    with col_logs:
-        st.subheader("System Status")
-        
-        # 1. Display Logs
-        if log_messages:
-            for msg in log_messages:
-                if "CRITICAL" in msg:
-                    st.error(msg)
-                elif "Defense" in msg:
-                    st.success(msg)
-                else:
-                    st.info(msg)
-        else:
-            st.write("✅ System operating within normal parameters.")
-
-        st.markdown("---")
-        st.subheader("🧮 Backend Metrics")
-        
-        # 2. Calculate Reliability using Backend Class
-        # We simulate a snapshot at T=1 hour for the current load
-        sw_load = traffic_input / 2 
-        if enable_ans: sw_load = sw_load / ratio
-        
-        fail_rate = ReliabilityMath.calculate_failure_rate('SwA1', sw_load, alpha=0.005)
-        reliability = ReliabilityMath.calculate_reliability(fail_rate, time_t=24) # 24 Hour projection
-        
-        # Display Metrics
-        st.metric("Projected Reliability (24h)", f"{reliability:.5f}")
-        st.metric("Failure Rate (h(t))", f"{fail_rate:.2e}")
-        
-        if enable_ans:
-            st.metric("Compression Benefit", f"{ratio:.2f}x Reduction")
-
-if __name__ == "__main__":
-    main()
+with col2:
+    st.subheader("Analysis")
+    max_load = max([d['load'] for d in node_data.values()]) if node_data else 0
+    
+    st.metric("Max Load", f"{int(max_load)} MB/s", help=f"Limit: {threshold}")
+    if ratio > 1.0: st.metric("Compression", f"{ratio:.2f}x")
+    
+    st.write("---")
+    for msg in logs:
+        if "FAIL" in msg: st.error(msg)
+        elif "Reroute" in msg: st.warning(msg)
+        elif "ANS" in msg: st.success(msg)
+        else: st.info(msg)

@@ -1,106 +1,172 @@
-import simpy
 import numpy as np
 import random
+import networkx as nx
 
-# --- CONFIGURATION & PAPER CONSTANTS ---
-# Baseline Failure Rates (from Table 1 of the PDF)
+# --- CONFIGURATION ---
 LAMBDA_0 = {
-    'Server': 1.04e-7,
+    'Server': 1.04e-7, 
     'Storage': 4.75e-11,
-    'SwA1': 4.75e-11,
-    'SwA2': 4.75e-11,
-    'SwB1': 4.75e-11,
-    'SwB2': 4.75e-11
+    'Switch': 4.75e-11
 }
 
 class ANSCompressor:
-    """
-    NOVELTY #1: Traffic Compression using Asymmetric Numeral Systems.
-    In a real system, this runs at the bit level. 
-    For simulation, we model the statistical reduction ratio.
-    """
     def __init__(self, min_ratio=1.2, max_ratio=2.8):
         self.min_ratio = min_ratio
         self.max_ratio = max_ratio
 
     def compress(self, data_size_mb):
-        # Calculate random compression ratio based on entropy
         ratio = random.uniform(self.min_ratio, self.max_ratio)
-        compressed_size = data_size_mb / ratio
-        return compressed_size, ratio
+        return data_size_mb / ratio, ratio
+
+class TopologyManager:
+    @staticmethod
+    def get_predefined_topology(type="Mesh"):
+        G = nx.DiGraph()
+        pos = {}
+        
+        if type == "Mesh (Standard)":
+            nodes = ['Server-1', 'SwA1', 'SwB1', 'SwA2', 'SwB2', 'Storage-1']
+            
+            # Vertical Flow
+            primary_edges = [
+                ('Server-1', 'SwA1'), ('Server-1', 'SwB1'), 
+                ('SwA1', 'SwA2'), ('SwB1', 'SwB2'), 
+                ('SwA2', 'Storage-1'), ('SwB2', 'Storage-1')
+            ]
+            # Horizontal Flow
+            backup_edges = [
+                ('SwA1', 'SwB1'), ('SwB1', 'SwA1'),
+                ('SwA2', 'SwB2'), ('SwB2', 'SwA2')
+            ]
+            
+            G.add_nodes_from(nodes)
+            for u, v in primary_edges: G.add_edge(u, v, type='primary')
+            for u, v in backup_edges: G.add_edge(u, v, type='backup')
+
+            pos = {
+                'Server-1': (0, 3), 'Storage-1': (0, 0),
+                'SwA1': (-1, 2), 'SwB1': (1, 2),
+                'SwA2': (-1, 1), 'SwB2': (1, 1)
+            }
+        
+        return G, pos
 
 class ReliabilityMath:
-    """
-    Implements the AFTM (Accelerated Failure Time Model) from the Paper.
-    """
     @staticmethod
-    def calculate_failure_rate(component_name, load_L, alpha=1.0):
-        """
-        Equation (2): h(t; L) = lambda_0 * e^(alpha * L)
-        """
-        lambda_0 = LAMBDA_0.get(component_name, 1.0e-5)
-        # Calculate accelerated failure rate
-        accelerated_lambda = lambda_0 * np.exp(alpha * load_L)
-        return accelerated_lambda
+    def calculate_failure_rate(component_name, load_L, alpha=0.005):
+        base = LAMBDA_0.get('Switch', 4.75e-11)
+        if load_L > 1200: alpha *= 5 
+        return base * np.exp(alpha * load_L)
 
     @staticmethod
-    def calculate_reliability(accelerated_lambda, time_t):
-        """
-        Equation (3/5): R(t) = e^(-lambda * t)
-        """
-        return np.exp(-accelerated_lambda * time_t)
+    def calculate_reliability(lam, t):
+        return np.exp(-lam * t)
 
-class SANSimulation:
-    def __init__(self):
-        self.env = simpy.Environment()
-        self.compressor = ANSCompressor()
-        self.results = []
+    @staticmethod
+    def simulate_traffic_flow(G, raw_traffic, scenario_type, threshold):
+        node_status = {}
+        compressor = ANSCompressor()
+        comp_ratio = 1.0
+        logs = []
 
-    def traffic_generator(self, switch_name, duration_hours):
-        """
-        Simulates traffic flowing into a switch over time.
-        """
-        t = 0
-        while t < duration_hours:
-            # 1. Generate Raw Load (Random between 50MB and 500MB)
-            raw_load = random.uniform(50, 500)
+        # 1. Initialize Nodes
+        for node in G.nodes():
+            node_status[node] = {'load': 0, 'color': '#00CC96', 'state': 'Safe'}
+
+        # 2. Source Injection
+        servers = [n for n in G.nodes() if "Server" in n]
+        if not servers: return {}, ["⚠️ No Server"], 1.0
+        
+        traffic_to_send = raw_traffic
+        if "ANS" in scenario_type or "Full" in scenario_type:
+            traffic_to_send, comp_ratio = compressor.compress(raw_traffic)
+            logs.append(f"✅ **ANS:** Reduced {int(raw_traffic)}MB -> {int(traffic_to_send)}MB")
+
+        # --- STEP A: SERVER -> LAYER 1 (IMBALANCED) ---
+        # To show Rerouting working, we intentionally imbalance the load
+        # SwA1 gets 60%, SwB1 gets 40%. 
+        # This ensures SwA1 fails first, allowing SwB1 to save it.
+        layer_1 = ['SwA1', 'SwB1']
+        layer_2 = ['SwA2', 'SwB2']
+        
+        # Traffic Logic
+        node_status['SwA1']['load'] += traffic_to_send * 0.60 # Heavier Load
+        node_status['SwB1']['load'] += traffic_to_send * 0.40 # Lighter Load
+
+        # --- STEP B: PROCESS LAYER 1 ---
+        for sw in layer_1:
+            load = node_status[sw]['load']
             
-            # 2. Apply Novelty #1 (ANS Compression)
-            comp_load, ratio = self.compressor.compress(raw_load)
-            
-            # 3. Calculate Paper Metrics (Reliability drops as load increases)
-            # We assume alpha=0.01 for sensitivity
-            fail_rate = ReliabilityMath.calculate_failure_rate(switch_name, comp_load, alpha=0.01)
-            reliability = ReliabilityMath.calculate_reliability(fail_rate, t)
+            if load > threshold:
+                # REROUTING LOGIC
+                if "Rerouting" in scenario_type or "Full" in scenario_type:
+                    neighbor = 'SwB1' if sw == 'SwA1' else 'SwA1'
+                    
+                    # Check if Neighbor has space
+                    neighbor_load = node_status[neighbor]['load']
+                    if neighbor_load < threshold:
+                        # Calculate how much to move
+                        slack = threshold - neighbor_load
+                        excess = load - threshold + 50 # Move enough to be safe
+                        
+                        # Can't move more than slack
+                        move_amount = min(excess, slack) 
+                        
+                        node_status[sw]['load'] -= move_amount
+                        node_status[neighbor]['load'] += move_amount
+                        
+                        node_status[sw]['state'] = 'Rerouted'
+                        node_status[sw]['color'] = '#FFA15A' # Orange
+                        logs.append(f"⚠️ **Reroute Active:** {sw} was {int(load)}MB. Moved {int(move_amount)}MB to {neighbor}.")
+                    else:
+                        # Neighbor full too? Die.
+                        node_status[sw]['state'] = 'Dead'
+                        node_status[sw]['color'] = '#000000'
+                        logs.append(f"❌ **FAIL:** {sw} overloaded ({int(load)}MB) & neighbor full.")
+                else:
+                    # BASELINE (No Rerouting)
+                    node_status[sw]['state'] = 'Dead'
+                    node_status[sw]['color'] = '#000000'
+                    logs.append(f"❌ **FAIL:** {sw} overloaded ({int(load)}MB). No defense.")
 
-            # 4. Log Data
-            self.results.append({
-                'time': t,
-                'switch': switch_name,
-                'raw_load': raw_load,
-                'compressed_load': comp_load,
-                'compression_ratio': ratio,
-                'reliability': reliability
-            })
-            
-            # Advance time by 1 hour
-            t += 1
-            yield self.env.timeout(1)
+        # --- STEP C: LAYER 1 -> LAYER 2 ---
+        for sw in layer_1:
+            if node_status[sw]['state'] != 'Dead':
+                # Push to Layer 2 counterpart
+                target = 'SwA2' if sw == 'SwA1' else 'SwB2'
+                node_status[target]['load'] += node_status[sw]['load']
 
-    def run_simulation(self, duration=24):
-        # Create a process for SwA1
-        self.env.process(self.traffic_generator('SwA1', duration))
-        self.env.run(until=duration)
-        return self.results
+        # --- STEP D: PROCESS LAYER 2 ---
+        for sw in layer_2:
+            load = node_status[sw]['load']
+            if load > threshold:
+                # Same Rerouting Logic for Layer 2
+                if "Rerouting" in scenario_type or "Full" in scenario_type:
+                    neighbor = 'SwB2' if sw == 'SwA2' else 'SwA2'
+                    neighbor_load = node_status[neighbor]['load']
+                    
+                    if neighbor_load < threshold:
+                        slack = threshold - neighbor_load
+                        excess = load - threshold + 50
+                        move_amount = min(excess, slack)
+                        
+                        node_status[sw]['load'] -= move_amount
+                        node_status[neighbor]['load'] += move_amount
+                        node_status[sw]['state'] = 'Rerouted'
+                        node_status[sw]['color'] = '#FFA15A'
+                        logs.append(f"⚠️ **Reroute:** {sw} -> {neighbor}")
+                    else:
+                        node_status[sw]['state'] = 'Dead'
+                        node_status[sw]['color'] = '#000000'
+                        logs.append(f"❌ **FAIL:** {sw} overloaded.")
+                else:
+                    node_status[sw]['state'] = 'Dead'
+                    node_status[sw]['color'] = '#000000'
+                    logs.append(f"❌ **FAIL:** {sw} overloaded.")
 
-# --- TEST BLOCK (Runs only if you execute this file directly) ---
-if __name__ == "__main__":
-    print("--- Starting Backend Simulation Test ---")
-    sim = SANSimulation()
-    data = sim.run_simulation(duration=10) # Run for 10 hours
-    
-    print(f"{'Time':<5} | {'Raw (MB)':<10} | {'Comp (MB)':<10} | {'Rel (R(t))':<10}")
-    print("-" * 45)
-    for row in data:
-        print(f"{row['time']:<5} | {row['raw_load']:<10.2f} | {row['compressed_load']:<10.2f} | {row['reliability']:.6f}")
-    print("--- Backend Test Complete ---")
+        # --- STEP E: LAYER 2 -> STORAGE ---
+        for sw in layer_2:
+             if node_status[sw]['state'] != 'Dead':
+                node_status['Storage-1']['load'] += node_status[sw]['load']
+
+        return node_status, logs, comp_ratio
