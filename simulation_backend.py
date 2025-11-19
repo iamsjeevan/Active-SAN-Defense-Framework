@@ -25,148 +25,148 @@ class TopologyManager:
         pos = {}
         
         if type == "Mesh (Standard)":
-            nodes = ['Server-1', 'SwA1', 'SwB1', 'SwA2', 'SwB2', 'Storage-1']
+            # N+1 Topology: Standby in the middle
+            nodes = ['Server-1', 'SwA1', 'SwB1', 'Sw-Standby', 'SwA2', 'SwB2', 'Storage-1']
             
-            # Vertical Flow
-            primary_edges = [
+            edges = [
                 ('Server-1', 'SwA1'), ('Server-1', 'SwB1'), 
-                ('SwA1', 'SwA2'), ('SwB1', 'SwB2'), 
-                ('SwA2', 'Storage-1'), ('SwB2', 'Storage-1')
-            ]
-            # Horizontal Flow
-            backup_edges = [
-                ('SwA1', 'SwB1'), ('SwB1', 'SwA1'),
-                ('SwA2', 'SwB2'), ('SwB2', 'SwA2')
+                ('SwA1', 'SwA2'), ('SwB1', 'SwB2'),
+                ('SwA2', 'Storage-1'), ('SwB2', 'Storage-1'),
+                # Standby Paths (Hidden unless active)
+                ('SwA1', 'Sw-Standby'), ('SwB1', 'Sw-Standby'), 
+                ('Sw-Standby', 'Storage-1')
             ]
             
             G.add_nodes_from(nodes)
-            for u, v in primary_edges: G.add_edge(u, v, type='primary')
-            for u, v in backup_edges: G.add_edge(u, v, type='backup')
+            G.add_edges_from(edges)
 
             pos = {
                 'Server-1': (0, 3), 'Storage-1': (0, 0),
-                'SwA1': (-1, 2), 'SwB1': (1, 2),
-                'SwA2': (-1, 1), 'SwB2': (1, 1)
+                'SwA1': (-1.5, 2), 'SwB1': (1.5, 2),
+                'Sw-Standby': (0, 1.2), # Center
+                'SwA2': (-1.5, 1), 'SwB2': (1.5, 1)
             }
         
         return G, pos
 
 class ReliabilityMath:
     @staticmethod
-    def calculate_failure_rate(component_name, load_L, alpha=0.005):
-        base = LAMBDA_0.get('Switch', 4.75e-11)
-        if load_L > 1200: alpha *= 5 
-        return base * np.exp(alpha * load_L)
-
-    @staticmethod
-    def calculate_reliability(lam, t):
-        return np.exp(-lam * t)
-
-    @staticmethod
     def simulate_traffic_flow(G, raw_traffic, scenario_type, threshold):
         node_status = {}
+        edge_flows = {} 
         compressor = ANSCompressor()
         comp_ratio = 1.0
         logs = []
 
-        # 1. Initialize Nodes
+        # 1. Initialize Nodes & Edges
         for node in G.nodes():
-            node_status[node] = {'load': 0, 'color': '#00CC96', 'state': 'Safe'}
-
-        # 2. Source Injection
-        servers = [n for n in G.nodes() if "Server" in n]
-        if not servers: return {}, ["⚠️ No Server"], 1.0
+            node_status[node] = {'load': 0, 'color': '#DDDDDD', 'state': 'Idle'}
         
+        for u, v in G.edges():
+            edge_flows[(u, v)] = 0
+
+        # 2. Determine Traffic Input
         traffic_to_send = raw_traffic
         if "ANS" in scenario_type or "Full" in scenario_type:
             traffic_to_send, comp_ratio = compressor.compress(raw_traffic)
-            logs.append(f"✅ **ANS:** Reduced {int(raw_traffic)}MB -> {int(traffic_to_send)}MB")
+            logs.append(f"✅ **ANS Active:** Traffic reduced to {int(traffic_to_send)}MB")
 
-        # --- STEP A: SERVER -> LAYER 1 (IMBALANCED) ---
-        # To show Rerouting working, we intentionally imbalance the load
-        # SwA1 gets 60%, SwB1 gets 40%. 
-        # This ensures SwA1 fails first, allowing SwB1 to save it.
-        layer_1 = ['SwA1', 'SwB1']
-        layer_2 = ['SwA2', 'SwB2']
+        # 3. Server Distribution (Imbalanced 60/40)
+        load_A = traffic_to_send * 0.60
+        load_B = traffic_to_send * 0.40
         
-        # Traffic Logic
-        node_status['SwA1']['load'] += traffic_to_send * 0.60 # Heavier Load
-        node_status['SwB1']['load'] += traffic_to_send * 0.40 # Lighter Load
+        node_status['Server-1']['load'] = traffic_to_send
+        node_status['Server-1']['color'] = '#00CC96'
+        node_status['Server-1']['state'] = 'OK'
 
-        # --- STEP B: PROCESS LAYER 1 ---
+        node_status['SwA1']['load'] = load_A
+        node_status['SwB1']['load'] = load_B
+        
+        edge_flows[('Server-1', 'SwA1')] = load_A
+        edge_flows[('Server-1', 'SwB1')] = load_B
+
+        # --- PROCESS LAYER 1 (SwA1, SwB1) ---
+        layer_1 = ['SwA1', 'SwB1']
+        
         for sw in layer_1:
+            current_load = node_status[sw]['load']
+            flow_main = current_load
+            flow_standby = 0
+            
+            # LOGIC: Check Threshold
+            if current_load > threshold:
+                
+                # CASE: REROUTING ON
+                if "Rerouting" in scenario_type or "Full" in scenario_type:
+                    # Math: Keep 95% of threshold, send rest to standby
+                    safe_capacity = threshold * 0.95
+                    excess = current_load - safe_capacity
+                    
+                    flow_main = safe_capacity
+                    flow_standby = excess
+                    
+                    # Update Status
+                    node_status[sw]['color'] = '#FFA15A' # Orange
+                    node_status[sw]['state'] = 'Rerouted'
+                    logs.append(f"⚠️ **Reroute:** {sw} sent {int(flow_standby)}MB to Standby.")
+
+                # CASE: BASELINE (No Reroute)
+                else:
+                    # Switch Dies. Flow stops.
+                    node_status[sw]['color'] = '#000000' # Black
+                    node_status[sw]['state'] = 'Dead'
+                    flow_main = 0 # Pipe Broken
+                    flow_standby = 0
+                    logs.append(f"❌ **FAILURE:** {sw} overloaded ({int(current_load)}MB).")
+            
+            else:
+                # Normal Operation
+                node_status[sw]['color'] = '#00CC96' # Green
+                node_status[sw]['state'] = 'Safe'
+
+            # Update Downstream Flows
+            # 1. To Main Layer 2
+            target = 'SwA2' if sw == 'SwA1' else 'SwB2'
+            edge_flows[(sw, target)] = flow_main
+            node_status[target]['load'] += flow_main
+            
+            # 2. To Standby (Only if flow > 0)
+            if flow_standby > 0:
+                edge_flows[(sw, 'Sw-Standby')] = flow_standby
+                node_status['Sw-Standby']['load'] += flow_standby
+                node_status['Sw-Standby']['color'] = '#FFA15A' # Active
+                node_status['Sw-Standby']['state'] = 'Active'
+
+        # --- PROCESS STANDBY ---
+        # If Standby has load, push to storage
+        standby_load = node_status['Sw-Standby']['load']
+        if standby_load > 0:
+             edge_flows[('Sw-Standby', 'Storage-1')] = standby_load
+             node_status['Storage-1']['load'] += standby_load
+
+        # --- PROCESS LAYER 2 (SwA2, SwB2) ---
+        layer_2 = ['SwA2', 'SwB2']
+        for sw in layer_2:
             load = node_status[sw]['load']
             
-            if load > threshold:
-                # REROUTING LOGIC
-                if "Rerouting" in scenario_type or "Full" in scenario_type:
-                    neighbor = 'SwB1' if sw == 'SwA1' else 'SwA1'
-                    
-                    # Check if Neighbor has space
-                    neighbor_load = node_status[neighbor]['load']
-                    if neighbor_load < threshold:
-                        # Calculate how much to move
-                        slack = threshold - neighbor_load
-                        excess = load - threshold + 50 # Move enough to be safe
-                        
-                        # Can't move more than slack
-                        move_amount = min(excess, slack) 
-                        
-                        node_status[sw]['load'] -= move_amount
-                        node_status[neighbor]['load'] += move_amount
-                        
-                        node_status[sw]['state'] = 'Rerouted'
-                        node_status[sw]['color'] = '#FFA15A' # Orange
-                        logs.append(f"⚠️ **Reroute Active:** {sw} was {int(load)}MB. Moved {int(move_amount)}MB to {neighbor}.")
-                    else:
-                        # Neighbor full too? Die.
-                        node_status[sw]['state'] = 'Dead'
-                        node_status[sw]['color'] = '#000000'
-                        logs.append(f"❌ **FAIL:** {sw} overloaded ({int(load)}MB) & neighbor full.")
+            if load > 0:
+                if load > threshold:
+                    node_status[sw]['color'] = '#EF553B' # Red (Warning)
+                    node_status[sw]['state'] = 'Overloaded'
+                    logs.append(f"❌ **Layer 2 Fail:** {sw} Overloaded.")
+                    # Assume broken pipe if layer 2 fails
+                    edge_flows[(sw, 'Storage-1')] = 0 
                 else:
-                    # BASELINE (No Rerouting)
-                    node_status[sw]['state'] = 'Dead'
-                    node_status[sw]['color'] = '#000000'
-                    logs.append(f"❌ **FAIL:** {sw} overloaded ({int(load)}MB). No defense.")
+                    node_status[sw]['color'] = '#00CC96'
+                    node_status[sw]['state'] = 'Safe'
+                    # Push to storage
+                    edge_flows[(sw, 'Storage-1')] = load
+                    node_status['Storage-1']['load'] += load
+            else:
+                # If no load reached here (upstream dead), stay grey
+                node_status[sw]['color'] = '#DDDDDD'
 
-        # --- STEP C: LAYER 1 -> LAYER 2 ---
-        for sw in layer_1:
-            if node_status[sw]['state'] != 'Dead':
-                # Push to Layer 2 counterpart
-                target = 'SwA2' if sw == 'SwA1' else 'SwB2'
-                node_status[target]['load'] += node_status[sw]['load']
+        # Storage Status
+        node_status['Storage-1']['color'] = '#00CC96'
 
-        # --- STEP D: PROCESS LAYER 2 ---
-        for sw in layer_2:
-            load = node_status[sw]['load']
-            if load > threshold:
-                # Same Rerouting Logic for Layer 2
-                if "Rerouting" in scenario_type or "Full" in scenario_type:
-                    neighbor = 'SwB2' if sw == 'SwA2' else 'SwA2'
-                    neighbor_load = node_status[neighbor]['load']
-                    
-                    if neighbor_load < threshold:
-                        slack = threshold - neighbor_load
-                        excess = load - threshold + 50
-                        move_amount = min(excess, slack)
-                        
-                        node_status[sw]['load'] -= move_amount
-                        node_status[neighbor]['load'] += move_amount
-                        node_status[sw]['state'] = 'Rerouted'
-                        node_status[sw]['color'] = '#FFA15A'
-                        logs.append(f"⚠️ **Reroute:** {sw} -> {neighbor}")
-                    else:
-                        node_status[sw]['state'] = 'Dead'
-                        node_status[sw]['color'] = '#000000'
-                        logs.append(f"❌ **FAIL:** {sw} overloaded.")
-                else:
-                    node_status[sw]['state'] = 'Dead'
-                    node_status[sw]['color'] = '#000000'
-                    logs.append(f"❌ **FAIL:** {sw} overloaded.")
-
-        # --- STEP E: LAYER 2 -> STORAGE ---
-        for sw in layer_2:
-             if node_status[sw]['state'] != 'Dead':
-                node_status['Storage-1']['load'] += node_status[sw]['load']
-
-        return node_status, logs, comp_ratio
+        return node_status, logs, comp_ratio, edge_flows
